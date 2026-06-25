@@ -36,7 +36,7 @@ final class FireworksVisionLLM: VisionLLMEngine {
         let body: [String: Any] = [
             "model": modelId,
             "temperature": 0,
-            "max_tokens": 512,
+            "max_tokens": 4000,
             "messages": [
                 ["role": "system",
                  "content": "You are a macOS computer-use agent. Respond with ONLY a JSON object — no prose, no reasoning, no markdown, no code fences. The first character must be '{' and the last must be '}'."],
