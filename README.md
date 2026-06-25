@@ -109,10 +109,4 @@ Contributions welcome. Keep every file under 200 lines (see `AGENTS.md`). Open a
 
 ## License
 
-**Elastic License 2.0** — source-available. You may use, copy, modify, merge, publish, distribute, and make derivative works, including for commercial purposes, **except** you may not:
-
-1. provide Pixi to third parties as a **managed service** where the service is Pixi itself;
-2. move, alter, disable, or circumvent any license-key functionality, or remove key functionality;
-3. alter, remove, or obscure any copyright, trademark, or other notices.
-
-See [LICENSE](LICENSE) for the full text. This is **not** an OSI-approved open-source license; it is a noncompetitive, source-available license.
+**GNU General Public License v3.0** — free, copyleft open-source. You may use, study, modify, and distribute Pixi (including commercially), but any derivative work must also be distributed under the GPL-3.0 with source available. No closed-source forks. See [LICENSE](LICENSE) for the full text.
