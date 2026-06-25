@@ -23,6 +23,8 @@ final class WorkflowController {
     enum Source { case typed, voice }
 
     private let maxSteps = 12
+    /// Run a goal-achievement check every N steps (and whenever `done` is requested).
+    private let verifyEvery = 3
 
     private init() {}
 
@@ -106,14 +108,11 @@ final class WorkflowController {
 
             // Execute the batch of actions in order WITHOUT re-perceiving
             // between them (the next turn re-sees the screen). `done` in the
-            // batch stops after the current action. Immediate-repeat loop
-            // detection applies across consecutive actions in the batch.
+            // batch requests completion — verified before accepting.
+            // Immediate-repeat loop detection applies across consecutive actions.
+            var doneRequested = false
             for (toolName, toolArgs) in actions {
-                if toolName == "done" {
-                    _ = await ToolRegistry.dispatch(name: "done", args: [:], interactionId: id)
-                    state.done = true
-                    break
-                }
+                if toolName == "done" { doneRequested = true; break }
                 let key = "\(toolName)|\(argsKey(toolArgs))"
                 if let last = lastKey, last == key {
                     AITrace.shared.addStep(to: id, kind: .tool,
@@ -128,6 +127,28 @@ final class WorkflowController {
                                                          interactionId: id)
                 state.history.append("\(toolName)(\(toolArgs)) → \(result.ok ? result.output : result.error ?? "failed")")
                 lastKey = result.ok ? key : nil
+            }
+            if state.done { break }
+
+            // Verify: re-see the screen and check the goal. On `done` request,
+            // gate it (reject premature completion). Periodically (every
+            // verifyEvery steps) check too, to catch goals achieved without
+            // an explicit done.
+            let needVerify = doneRequested || (state.step % verifyEvery == 0)
+            if needVerify, let achieved = await verify(goal: state.goal, engine: engine, id: id) {
+                if achieved {
+                    _ = await ToolRegistry.dispatch(name: "done", args: [:], interactionId: id)
+                    state.done = true
+                    break
+                } else if doneRequested {
+                    // Model claimed done but the goal isn't achieved — keep going.
+                    state.history.append("verify: goal NOT achieved — continue")
+                    AITrace.shared.addStep(to: id, kind: .tool,
+                                           label: "verify rejected done",
+                                           input: state.goal,
+                                           output: "goal not achieved — continuing",
+                                           status: .failed, durationMs: 0)
+                }
             }
 
             // checkpoint: persist a state snapshot for this thread/step.
@@ -150,6 +171,41 @@ final class WorkflowController {
     }
 
     // MARK: - Nodes
+
+    /// Verify node: re-capture the screen and ask the vision LLM whether the
+    /// goal is achieved. Returns nil if the check itself fails (treat as
+    /// "not yet"), Bool otherwise. Traced as a `verify` step.
+    private func verify(goal: String, engine: FireworksVisionLLM, id: UUID) async -> Bool? {
+        guard let (cg, _) = await ScreenCapture.captureMainScreen() else { return nil }
+        let t0 = Date()
+        let prompt = "Goal: \(goal). Look at this screenshot. Has the goal been achieved? " +
+            "Respond with ONLY JSON: {\"achieved\": true|false, \"reason\": \"...\"}."
+        do {
+            let raw = try await engine.analyze(imageData: resizedPNG(cg, maxDim: 1280),
+                                               prompt: prompt)
+            let achieved = parseAchieved(raw)
+            AITrace.shared.addStep(to: id, kind: .vision,
+                                   label: "verify",
+                                   input: goal,
+                                   output: "\(achieved) | \(raw.prefix(160))",
+                                   status: .success, durationMs: ms(t0))
+            return achieved
+        } catch {
+            AITrace.shared.addStep(to: id, kind: .vision,
+                                   label: "verify", input: goal,
+                                   output: "\(error)", status: .failed, durationMs: ms(t0))
+            return nil
+        }
+    }
+
+    private func parseAchieved(_ text: String) -> Bool {
+        guard let blob = firstJSONBlob(text),
+              let data = blob.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return false
+        }
+        return (obj["achieved"] as? Bool) ?? false
+    }
 
     /// perceive: capture screen + AX snapshot.
     private func perceive(_ state: inout State, id: UUID) async {
@@ -201,7 +257,7 @@ final class WorkflowController {
         }
         p += "Respond with ONLY JSON, first char '{', last '}':\n"
         p += "{\"actions\": [{\"tool\": \"<action>\", \"args\": {<keys>}}, ...], \"memory\": [\"<short fact>\", ...]}\n"
-        p += "Try to group as many actions as possible into one turn. `done` as an action ends the task. memory = new facts worth keeping; omit or [] if nothing new.\n"
+        p += "Try to group as many actions as possible into one turn. `done` ends the task — only call it when the goal is visibly achieved on screen (the system verifies). memory = new facts worth keeping; omit or [] if nothing new.\n"
         p += "If goal achieved: {\"actions\": [{\"tool\": \"done\", \"args\": {}}]}"
         return p
     }
