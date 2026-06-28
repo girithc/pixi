@@ -33,6 +33,7 @@ enum ToolRegistry {
         OpenAppTool(),
         ListAppsTool(),
         ListRunningAppsTool(),
+        ArrangeWindowsTool(),
         ListToolsTool(),
         SystemSettingsTool(),
         AppleScriptTool(),
