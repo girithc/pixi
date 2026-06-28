@@ -34,6 +34,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         CursorBuddy.shared.start()
 
+        // Menu-bar status item (top-right) — click for live interaction status.
+        StatusItemController.shared.start()
+
+        // By default only the CursorBuddy is visible — hide the main app
+        // window (interactions) on launch. It opens via Option + M below.
+        DispatchQueue.main.async { self.hideMainWindow() }
+
+        // Option + M — toggle the main app window (interactions).
+        HotkeyManager.shared.register(
+            keyCode: kVK_ANSI_M,
+            modifiers: UInt32(optionKey),
+            id: 0
+        ) {
+            self.toggleMainWindow()
+        }
+
         // Option + K — toggle the typed-command input panel.
         HotkeyManager.shared.register(
             keyCode: kVK_ANSI_K,
@@ -55,5 +71,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         HotkeyManager.shared.unregisterAll()
+    }
+
+    // MARK: - Main window visibility
+
+    /// The SwiftUI WindowGroup window — the only non-panel NSWindow (panels
+    /// are CursorBuddy, overlay, input space).
+    private func mainWindow() -> NSWindow? {
+        NSApp.windows.first { !($0 is NSPanel) }
+    }
+
+    private func toggleMainWindow() {
+        if let w = mainWindow() {
+            if w.isVisible { w.orderOut(nil) }
+            else {
+                NSApp.activate(ignoringOtherApps: true)
+                w.makeKeyAndOrderFront(nil)
+            }
+        }
+    }
+
+    private func hideMainWindow() {
+        mainWindow()?.orderOut(nil)
     }
 }

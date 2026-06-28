@@ -53,6 +53,7 @@ final class CursorBuddy {
         )
         p.isFloatingPanel = true
         p.level = .statusBar
+        p.identifier = NSUserInterfaceItemIdentifier("pixi.cursorbuddy")
         p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         p.isOpaque = false
         p.backgroundColor = .clear

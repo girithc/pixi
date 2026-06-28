@@ -9,7 +9,7 @@ import SwiftUI
 import AppKit
 
 struct ContentView: View {
-    @State private var selection: SidebarItem? = .home
+    @State private var selection: SidebarItem? = .interactions
 
     var body: some View {
         // Plain HStack split — NavigationSplitView forces a system material

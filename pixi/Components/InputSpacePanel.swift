@@ -50,6 +50,7 @@ final class InputSpaceController: NSObject {
         panel.isMovableByWindowBackground = true
         panel.isFloatingPanel = true
         panel.level = .floating
+        panel.identifier = NSUserInterfaceItemIdentifier("pixi.inputspace")
         panel.hidesOnDeactivate = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.isOpaque = false
