@@ -16,6 +16,7 @@ import AppKit
 struct InteractionsView: View {
     @ObservedObject private var trace = AITrace.shared
     @State private var expanded: Set<UUID> = []
+    @State private var expandedSteps: Set<UUID> = []
     @State private var fullSizeItem: AITrace.Interaction?
 
     var body: some View {
@@ -31,6 +32,7 @@ struct InteractionsView: View {
         .listStyle(.inset)
         .scrollContentBackground(.hidden)
         .background(.clear)
+
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .sheet(item: $fullSizeItem) { item in
             if let image = item.screenshot {
@@ -59,6 +61,9 @@ struct InteractionsView: View {
                     }
 
                     Spacer(minLength: 8)
+                    if isActive(item.status) {
+                        controls(item)
+                    }
                     statusBadge(item.status)
                     Text(item.timeLabel)
                         .font(.subheadline).foregroundStyle(.tertiary)
@@ -124,11 +129,25 @@ struct InteractionsView: View {
 
             Text("Steps").font(.subheadline.weight(.semibold))
             VStack(alignment: .leading, spacing: 8) {
-                ForEach(item.steps) { step in
-                    stepRow(step)
+                ForEach(groupedSteps(item.steps), id: \.0) { grp in
+                    groupCard(grp.0, grp.1)
                 }
             }
         }
+    }
+
+    /// Group steps by their agent-iteration index, preserving order. Steps
+    /// sharing a group (AX → vision → memory → tools) form one card.
+    private func groupedSteps(_ steps: [AITrace.Step]) -> [(Int, [AITrace.Step])] {
+        var out: [(Int, [AITrace.Step])] = []
+        for s in steps {
+            if let last = out.last, last.0 == s.group {
+                out[out.count - 1].1.append(s)
+            } else {
+                out.append((s.group, [s]))
+            }
+        }
+        return out
     }
 
     private func copyInteraction(_ item: AITrace.Interaction) {
@@ -144,11 +163,18 @@ struct InteractionsView: View {
         lines.append("Status: \(statusName(item.status))")
         lines.append("")
         lines.append("Steps:")
-        for (i, step) in item.steps.enumerated() {
-            let ms = step.durationMs > 0 ? " (\(step.durationMs)ms)" : ""
-            lines.append("\(i + 1). [\(statusName(step.status))] \(step.label)\(ms)")
-            if !step.input.isEmpty { lines.append("   in:  \(step.input)") }
-            if !step.output.isEmpty { lines.append("   out: \(step.output)") }
+        for (gi, grp) in groupedSteps(item.steps).enumerated() {
+            let total = grp.1.reduce(0) { $0 + $1.durationMs }
+            lines.append("Step \(gi + 1) — \(grp.1.first?.label ?? "") \(total > 0 ? "(\(total)ms total)" : "")")
+            for step in grp.1 {
+                let ms = step.durationMs > 0 ? " (\(step.durationMs)ms)" : ""
+                lines.append("  [\(statusName(step.status))] \(step.label)\(ms)")
+                if !step.input.isEmpty { lines.append("    in:  \(step.input)") }
+                if !step.output.isEmpty { lines.append("    out: \(step.output)") }
+                if !step.detail.isEmpty && step.detail != step.output {
+                    lines.append("    log: \(step.detail)")
+                }
+            }
         }
         if let targets = item.targets, !targets.isEmpty {
             lines.append("")
@@ -162,6 +188,39 @@ struct InteractionsView: View {
         switch s {
         case .pending: "pending"; case .running: "running"
         case .success: "success"; case .failed: "failed"
+        }
+    }
+
+    private func isActive(_ s: AITrace.Step.Status) -> Bool {
+        s == .running || s == .pending
+    }
+
+    @ViewBuilder
+    private func controls(_ item: AITrace.Interaction) -> some View {
+        HStack(spacing: 4) {
+            Button {
+                WorkflowController.shared.stop(item.id)
+            } label: {
+                Image(systemName: "stop.fill")
+                    .font(.system(size: 11, weight: .semibold))
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .help("Stop the interaction")
+
+            Button {
+                if item.paused {
+                    WorkflowController.shared.resume(item.id)
+                } else {
+                    WorkflowController.shared.pause(item.id)
+                }
+            } label: {
+                Image(systemName: item.paused ? "play.fill" : "pause.fill")
+                    .font(.system(size: 11, weight: .semibold))
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .help(item.paused ? "Resume" : "Pause")
         }
     }
 
@@ -206,40 +265,94 @@ struct InteractionsView: View {
             .stroke(Color.primary.opacity(0.1), lineWidth: 1))
     }
 
+    /// One combined card per agent iteration: AX tree → vision → memory →
+    /// tools, each as a sub-row with its own input/output + full log.
     @ViewBuilder
-    private func stepRow(_ step: AITrace.Step) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 6) {
-                statusBadge(step.status)
-                Text(step.label).font(.subheadline.weight(.semibold))
-                Spacer()
-                if step.durationMs > 0 {
-                    Text("\(step.durationMs)ms")
-                        .font(.caption).foregroundStyle(.tertiary)
+    private func groupCard(_ group: Int, _ steps: [AITrace.Step]) -> some View {
+        let key = steps.first?.id ?? UUID()
+        let isOpen = expandedSteps.contains(key)
+        let aggregate = steps.reduce(into: AITrace.Step.Status.success) { acc, s in
+            if s.status == .failed { acc = .failed }
+            else if s.status == .running && acc != .failed { acc = .running }
+            else if s.status == .pending && acc == .success { acc = .pending }
+        }
+        let total = steps.reduce(0) { $0 + $1.durationMs }
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                if isOpen { expandedSteps.remove(key) }
+                else { expandedSteps.insert(key) }
+            } label: {
+                HStack(spacing: 8) {
+                    statusBadge(aggregate)
+                    Text("Step \(group)")
+                        .font(.subheadline.weight(.semibold))
+                    Text(steps.map(\.label).joined(separator: " · "))
+                        .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    Spacer(minLength: 4)
+                    if total > 0 {
+                        Text("\(total)ms")
+                            .font(.caption).foregroundStyle(.tertiary)
+                    }
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                        .rotationEffect(.degrees(isOpen ? 90 : 0))
                 }
+                .contentShape(Rectangle())
             }
-            if !step.input.isEmpty {
-                Text("Input")
-                    .font(.caption2).foregroundStyle(.tertiary)
-                Text(step.input)
-                    .font(.system(.caption, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(3)
-                    .multilineTextAlignment(.leading)
-            }
-            if !step.output.isEmpty {
-                Text("Output")
-                    .font(.caption2).foregroundStyle(.tertiary)
-                Text(step.output)
-                    .font(.system(.caption, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(8)
-                    .multilineTextAlignment(.leading)
+            .buttonStyle(.plain)
+
+            if isOpen {
+                Divider().padding(.vertical, 8)
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(steps) { step in
+                        subRow(step)
+                    }
+                }
             }
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
         .glassEffect(in: RoundedRectangle(cornerRadius: 10))
+    }
+
+    @ViewBuilder
+    private func subRow(_ step: AITrace.Step) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                statusBadge(step.status)
+                Text(step.label)
+                    .font(.caption.weight(.semibold))
+                if step.durationMs > 0 {
+                    Text("\(step.durationMs)ms")
+                        .font(.caption2).foregroundStyle(.tertiary)
+                }
+            }
+            if !step.input.isEmpty {
+                stepIO(label: "in", text: step.input)
+            }
+            if !step.output.isEmpty {
+                stepIO(label: "out", text: step.output)
+            }
+            if !step.detail.isEmpty && step.detail != step.output {
+                stepIO(label: "log", text: step.detail)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func stepIO(label: String, text: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(label)
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.tertiary)
+                .textCase(.uppercase)
+            Text(text)
+                .font(.system(.caption, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.leading)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
     }
 
     @ViewBuilder

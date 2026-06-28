@@ -43,7 +43,6 @@ enum ToolRegistry {
         TypeTool(),
         KeyTool(),
         ScrollTool(),
-        VisionClickTool(),
         DoneTool()
     ]
 
@@ -61,7 +60,7 @@ enum ToolRegistry {
     }
 
     static func dispatch(name: String, args: [String: Any],
-                         interactionId: UUID) async -> ToolResult {
+                         interactionId: UUID, group: Int = 0) async -> ToolResult {
         let t0 = Date()
         let result: ToolResult
         if let tool = tools.first(where: { $0.name == name }) {
@@ -75,7 +74,9 @@ enum ToolRegistry {
             input: argsDescription(args),
             output: result.ok ? result.output : (result.error ?? "failed"),
             status: result.ok ? .success : .failed,
-            durationMs: ms)
+            durationMs: ms,
+            group: group,
+            detail: result.ok ? result.output : (result.error ?? "failed"))
         return result
     }
 

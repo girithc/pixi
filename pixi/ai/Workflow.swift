@@ -23,10 +23,28 @@ final class WorkflowController {
     enum Source { case typed, voice }
 
     private let maxSteps = 12
-    /// Run a goal-achievement check every N steps (and whenever `done` is requested).
-    private let verifyEvery = 3
+
+    /// Per-interaction control flags, set from the UI. The run loop honors
+    /// these between iterations: abort stops the run; pause holds it.
+    private var aborts: Set<UUID> = []
+    private var paused: Set<UUID> = []
 
     private init() {}
+
+    /// User requested stop — the run loop exits at the next iteration boundary.
+    func stop(_ id: UUID) { aborts.insert(id) }
+
+    /// User toggled pause. While paused, the loop sleeps without acting.
+    func pause(_ id: UUID) {
+        paused.insert(id)
+        AITrace.shared.setPaused(id: id, true)
+    }
+
+    /// User resumed a paused run.
+    func resume(_ id: UUID) {
+        paused.remove(id)
+        AITrace.shared.setPaused(id: id, false)
+    }
 
     // MARK: - Graph state
 
@@ -49,6 +67,7 @@ final class WorkflowController {
         let symbol = source == .voice ? "waveform" : "keyboard"
         let id = interactionId
             ?? AITrace.shared.begin(title: title, subtitle: trimmed, symbol: symbol)
+        AITrace.shared.setRunning(id: id)
 
         let engine = FireworksVisionLLM(modelId: AppSettings.shared.visionModelId,
                                         apiKey: AppSettings.shared.fireworksKey)
@@ -59,6 +78,23 @@ final class WorkflowController {
 
         // Drive the graph.
         while !state.done && state.step < maxSteps {
+            // User controls: abort stops; pause holds without acting.
+            if aborts.contains(id) {
+                aborts.remove(id)
+                paused.remove(id)
+                AITrace.shared.addStep(to: id, kind: .tool, label: "stopped",
+                                       input: "", output: "aborted by user",
+                                       status: .failed, durationMs: 0,
+                                       group: state.step)
+                AITrace.shared.complete(id: id, status: .failed, output: "aborted by user")
+                return
+            }
+            while paused.contains(id) {
+                try? await Task.sleep(nanoseconds: 300_000_000)
+                if aborts.contains(id) { break }
+            }
+            if aborts.contains(id) { continue }
+
             state.step &+= 1
 
             // perceive
@@ -77,7 +113,8 @@ final class WorkflowController {
                 AITrace.shared.addStep(to: id, kind: .vision,
                                        label: "Vision (\(AppSettings.shared.visionLlm))",
                                        input: "step \(state.step)", output: "\(error)",
-                                       status: .failed, durationMs: 0)
+                                       status: .failed, durationMs: 0,
+                                       group: state.step)
                 AITrace.shared.complete(id: id, status: .failed, output: "\(error)")
                 return
             }
@@ -86,9 +123,10 @@ final class WorkflowController {
                                    label: "Vision (\(AppSettings.shared.visionLlm))",
                                    input: "step \(state.step)",
                                    output: String(raw.prefix(240)),
-                                   status: .success, durationMs: ms(t))
+                                   status: .success, durationMs: ms(t),
+                                   group: state.step, detail: raw)
 
-            guard let (actions, memUpdates) = parseActions(raw), !actions.isEmpty else {
+            guard let (actions, memUpdates, achieved) = parseActions(raw) else {
                 AITrace.shared.complete(id: id, status: .failed,
                                         output: "unparseable: \(raw.prefix(200))")
                 return
@@ -103,53 +141,74 @@ final class WorkflowController {
                                        label: "memory",
                                        input: memUpdates.joined(separator: "; "),
                                        output: "\(state.memory.count) facts",
-                                       status: .success, durationMs: 0)
+                                       status: .success, durationMs: 0,
+                                       group: state.step,
+                                       detail: state.memory.joined(separator: "\n"))
+            }
+
+            // Pre-check from the same vision call: the model claims the goal
+            // is achieved. Don't trust it — run ONE dedicated vision verify on
+            // a fresh full-screen capture (no crop, so it sees the target app
+            // even if focus drifted). This is the N+1 call: only fires when
+            // completion is claimed, not every step.
+            if achieved {
+                let verified = await verify(goal: state.goal, engine: engine, id: id,
+                                            group: state.step)
+                if verified == true {
+                    _ = await ToolRegistry.dispatch(name: "done", args: [:], interactionId: id,
+                                                    group: state.step)
+                    state.done = true
+                    break
+                } else {
+                    // Model claimed done but vision says otherwise — keep going.
+                    state.history.append("verify: goal NOT achieved — continue")
+                    AITrace.shared.addStep(to: id, kind: .tool,
+                                           label: "verify rejected done",
+                                           input: state.goal,
+                                           output: "goal not achieved on screen — continuing",
+                                           status: .failed, durationMs: 0,
+                                           group: state.step)
+                }
+            }
+
+            guard !actions.isEmpty else {
+                AITrace.shared.addStep(to: id, kind: .tool,
+                                       label: "no actions",
+                                       input: "",
+                                       output: "achieved=false but no actions — continuing",
+                                       status: .failed, durationMs: 0,
+                                       group: state.step)
+                continue
             }
 
             // Execute the batch of actions in order WITHOUT re-perceiving
-            // between them (the next turn re-sees the screen). `done` in the
-            // batch requests completion — verified before accepting.
+            // between them (the next turn re-sees the screen).
             // Immediate-repeat loop detection applies across consecutive actions.
-            var doneRequested = false
             for (toolName, toolArgs) in actions {
-                if toolName == "done" { doneRequested = true; break }
+                if toolName == "done" {
+                    // Model emitted done but didn't set achieved — trust it
+                    // only if it also set achieved; otherwise ignore and keep
+                    // going (the pre-check is authoritative).
+                    break
+                }
                 let key = "\(toolName)|\(argsKey(toolArgs))"
                 if let last = lastKey, last == key {
                     AITrace.shared.addStep(to: id, kind: .tool,
                                            label: "loop detected",
                                            input: key,
                                            output: "repeated the last action — stopping",
-                                           status: .failed, durationMs: 0)
+                                           status: .failed, durationMs: 0,
+                                           group: state.step)
                     state.done = true
                     break
                 }
                 let result = await ToolRegistry.dispatch(name: toolName, args: toolArgs,
-                                                         interactionId: id)
+                                                         interactionId: id,
+                                                         group: state.step)
                 state.history.append("\(toolName)(\(toolArgs)) → \(result.ok ? result.output : result.error ?? "failed")")
                 lastKey = result.ok ? key : nil
             }
             if state.done { break }
-
-            // Verify: re-see the screen and check the goal. On `done` request,
-            // gate it (reject premature completion). Periodically (every
-            // verifyEvery steps) check too, to catch goals achieved without
-            // an explicit done.
-            let needVerify = doneRequested || (state.step % verifyEvery == 0)
-            if needVerify, let achieved = await verify(goal: state.goal, engine: engine, id: id) {
-                if achieved {
-                    _ = await ToolRegistry.dispatch(name: "done", args: [:], interactionId: id)
-                    state.done = true
-                    break
-                } else if doneRequested {
-                    // Model claimed done but the goal isn't achieved — keep going.
-                    state.history.append("verify: goal NOT achieved — continue")
-                    AITrace.shared.addStep(to: id, kind: .tool,
-                                           label: "verify rejected done",
-                                           input: state.goal,
-                                           output: "goal not achieved — continuing",
-                                           status: .failed, durationMs: 0)
-                }
-            }
 
             // checkpoint: persist a state snapshot for this thread/step.
             JSONFileCheckpointer.shared.save(CheckpointSnapshot(
@@ -162,6 +221,8 @@ final class WorkflowController {
         AITrace.shared.complete(id: id,
                                 status: .success,
                                 output: "\(outcome) — memory: \(state.memory.count) facts")
+        aborts.remove(id)
+        paused.remove(id)
 
         // Final checkpoint (per-thread; not shared across interactions).
         JSONFileCheckpointer.shared.save(CheckpointSnapshot(
@@ -172,13 +233,18 @@ final class WorkflowController {
 
     // MARK: - Nodes
 
-    /// Verify node: re-capture the screen and ask the vision LLM whether the
-    /// goal is achieved. Returns nil if the check itself fails (treat as
-    /// "not yet"), Bool otherwise. Traced as a `verify` step.
-    private func verify(goal: String, engine: FireworksVisionLLM, id: UUID) async -> Bool? {
+    /// Verify node: re-capture the FULL screen and ask the vision LLM whether
+    /// the goal is achieved. Used only when the reason call claims achieved —
+    /// a dedicated check so the model can't self-certify a wrong completion.
+    /// Full-screen (no frontmost crop) so it sees the target app even if focus
+    /// drifted. Returns nil if the check itself fails (treat as not yet).
+    private func verify(goal: String, engine: FireworksVisionLLM, id: UUID,
+                        group: Int) async -> Bool? {
         guard let (cg, _) = await ScreenCapture.captureMainScreen() else { return nil }
         let t0 = Date()
-        let prompt = "Goal: \(goal). Look at this screenshot. Has the goal been achieved? " +
+        let prompt = "Goal: \(goal). Look at this screenshot carefully. Has the goal " +
+            "actually been achieved and visible on screen right now? Do NOT infer from " +
+            "past actions — only what is visible. " +
             "Respond with ONLY JSON: {\"achieved\": true|false, \"reason\": \"...\"}."
         do {
             let raw = try await engine.analyze(imageData: resizedPNG(cg, maxDim: 1280),
@@ -188,12 +254,14 @@ final class WorkflowController {
                                    label: "verify",
                                    input: goal,
                                    output: "\(achieved) | \(raw.prefix(160))",
-                                   status: .success, durationMs: ms(t0))
+                                   status: .success, durationMs: ms(t0),
+                                   group: group, detail: raw)
             return achieved
         } catch {
             AITrace.shared.addStep(to: id, kind: .vision,
                                    label: "verify", input: goal,
-                                   output: "\(error)", status: .failed, durationMs: ms(t0))
+                                   output: "\(error)", status: .failed, durationMs: ms(t0),
+                                   group: group)
             return nil
         }
     }
@@ -223,14 +291,16 @@ final class WorkflowController {
         AITrace.shared.attachMedia(id: id,
                                    screenshot: NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height)),
                                    targets: [], frame: frame)
-        if state.step == 1 {
-            AITrace.shared.addStep(to: id, kind: .tool,
-                                   label: state.ax.isEmpty ? "Accessibility (unavailable)" : "Accessibility tree",
-                                   input: "",
-                                   output: state.ax.isEmpty ? "not trusted" : "\(state.ax.count) chars",
-                                   status: state.ax.isEmpty ? .failed : .success,
-                                   durationMs: ms(t0))
-        }
+        // Record the AX snapshot every iteration so each step card carries
+        // its own tree; full text lives in `detail` for copy/expand.
+        AITrace.shared.addStep(to: id, kind: .tool,
+                               label: state.ax.isEmpty ? "Accessibility (unavailable)" : "Accessibility tree",
+                               input: "",
+                               output: state.ax.isEmpty ? "not trusted" : "\(state.ax.count) chars",
+                               status: state.ax.isEmpty ? .failed : .success,
+                               durationMs: ms(t0),
+                               group: state.step,
+                               detail: state.ax)
     }
 
     // MARK: - Prompt + parse
@@ -239,7 +309,7 @@ final class WorkflowController {
         var p = "You are a computer-use agent that drives macOS like a human: you see this screenshot and pick ONE next action.\n\n"
         p += "User goal: \(state.goal)\n\n"
         p += "Available actions:\n\(ToolRegistry.manifest)\n\n"
-        p += "Coord for click normalized 0..1 from image TOP-LEFT. Rule: if the goal involves an app, call list_apps FIRST — never assume an app is installed from icons/screenshots. Each tool's description (call list_tools if unsure) says when to use it. Don't repeat an action that already failed — change approach. Don't redo an action that already succeeded (e.g. if you pressed return to submit a search, do NOT type the query again — click a result or call done). If the goal is a search and the search is submitted/loaded, call done.\n\n"
+        p += "Coord for click normalized 0..1 from image TOP-LEFT. Ground click coords yourself from the screenshot — do NOT call vision_click. Rule: if the goal involves an app, call list_apps FIRST — never assume an app is installed from icons/screenshots. Each tool's description (call list_tools if unsure) says when to use it. Don't repeat an action that already failed — change approach. Don't redo an action that already succeeded (e.g. if you pressed return to submit a search, do NOT type the query again — click a result). DEFAULT: 'rearrange/organize/tidy/tile tabs/windows/apps' means tiling app WINDOWS across the screen — call arrange_windows. Only treat 'tabs' as in-app browser tab reorder if the user explicitly names ONE app's tabs (e.g. 'rearrange Safari's tabs') — and no tool does that, so say so instead of hand-writing AppleScript.\n\n"
         if !state.ax.isEmpty {
             p += "AX tree (role \"title\" [x y w h]):\n\(state.ax)\n\n"
         } else {
@@ -256,32 +326,35 @@ final class WorkflowController {
             p += "\n"
         }
         p += "Respond with ONLY JSON, first char '{', last '}':\n"
-        p += "{\"actions\": [{\"tool\": \"<action>\", \"args\": {<keys>}}, ...], \"memory\": [\"<short fact>\", ...]}\n"
-        p += "Try to group as many actions as possible into one turn. `done` ends the task — only call it when the goal is visibly achieved on screen (the system verifies). memory = new facts worth keeping; omit or [] if nothing new.\n"
-        p += "If goal achieved: {\"actions\": [{\"tool\": \"done\", \"args\": {}}]}"
+        p += "{\"achieved\": <true|false>, \"actions\": [{\"tool\": \"<action>\", \"args\": {<keys>}}, ...], \"memory\": [\"<short fact>\", ...]}\n"
+        p += "This single response does BOTH: (1) pre-check — set achieved:true ONLY if the goal is visibly achieved on the current screenshot; (2) next steps — if achieved is false, give the actions to progress the goal. If achieved is true, actions may be [] (the task ends). Try to group as many actions as possible into one turn. memory = new facts worth keeping; omit or [] if nothing new.\n"
+        p += "If goal achieved: {\"achieved\": true, \"actions\": [], \"memory\": [...]}"
         return p
     }
 
-    /// Parse the model response into a batch of actions + memory updates.
-    /// Accepts `{"actions":[{"tool":...,"args":...}, ...], "memory":[...]}`
-    /// or the single-action shape `{"tool":...,"args":...,"memory":[...]}`.
-    private func parseActions(_ text: String) -> ([(String, [String: Any])], [String])? {
+    /// Parse the model response into actions + memory + achieved flag.
+    /// One vision call per step does BOTH the goal pre-check and the next
+    /// actions: `achieved:true` ends the task, `achieved:false` runs actions.
+    /// Accepts `{"achieved":bool, "actions":[...], "memory":[...]}` or the
+    /// single-action shape `{"tool":...,"args":...,"memory":[...]}`.
+    private func parseActions(_ text: String) -> ([(String, [String: Any])], [String], Bool)? {
         guard let blob = firstJSONBlob(text),
               let data = blob.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return nil
         }
         let mem = (obj["memory"] as? [String]) ?? []
+        let achieved = (obj["achieved"] as? Bool) ?? false
         if let arr = obj["actions"] as? [[String: Any]] {
             let acts = arr.compactMap { item -> (String, [String: Any])? in
                 guard let tool = item["tool"] as? String else { return nil }
                 return (tool, (item["args"] as? [String: Any]) ?? [:])
             }
-            return (acts, mem)
+            return (acts, mem, achieved)
         }
         if let tool = obj["tool"] as? String {
             let args = (obj["args"] as? [String: Any]) ?? [:]
-            return ([(tool, args)], mem)
+            return ([(tool, args)], mem, achieved)
         }
         return nil
     }

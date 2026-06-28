@@ -29,17 +29,24 @@ final class AITrace: ObservableObject {
         return item.id
     }
 
-    /// Append a workflow step to an existing interaction.
+    /// Append a workflow step to an existing interaction. `group` is the
+    /// agent iteration index (state.step) — steps sharing a group render as
+    /// one combined card (AX → vision → memory → tools). `detail` holds the
+    /// full log content (AX tree text, raw vision response) for copy/expand;
+    /// `output` stays a short display label.
     func addStep(to id: UUID,
                  kind: Step.Kind,
                  label: String,
                  input: String,
                  output: String = "",
                  status: Step.Status = .pending,
-                 durationMs: Int = 0) {
+                 durationMs: Int = 0,
+                 group: Int = 0,
+                 detail: String = "") {
         guard let idx = interactions.firstIndex(where: { $0.id == id }) else { return }
         let step = Step(kind: kind, label: label, input: input,
-                        output: output, status: status, durationMs: durationMs)
+                        output: output, status: status, durationMs: durationMs,
+                        group: group, detail: detail)
         interactions[idx].steps.append(step)
         interactions[idx].subtitle = step.label
     }
@@ -49,6 +56,19 @@ final class AITrace: ObservableObject {
         guard let idx = interactions.firstIndex(where: { $0.id == id }) else { return }
         interactions[idx].status = status
         interactions[idx].output = output
+        interactions[idx].paused = false
+    }
+
+    /// Mark an interaction as actively running (shows Stop/Pause controls).
+    func setRunning(id: UUID) {
+        guard let idx = interactions.firstIndex(where: { $0.id == id }) else { return }
+        interactions[idx].status = .running
+    }
+
+    /// Toggle the paused flag (drives Pause/Resume label + loop wait).
+    func setPaused(id: UUID, _ paused: Bool) {
+        guard let idx = interactions.firstIndex(where: { $0.id == id }) else { return }
+        interactions[idx].paused = paused
     }
 
     /// Update an interaction's subtitle (e.g. the final transcript).
@@ -74,6 +94,7 @@ final class AITrace: ObservableObject {
         var steps: [Step] = []
         var status: Step.Status = .pending
         var output: String = ""
+        var paused: Bool = false
 
         // Inspect-only media for the Interactions detail view.
         var screenshot: NSImage?
@@ -91,6 +112,10 @@ final class AITrace: ObservableObject {
         var output: String
         var status: Status
         let durationMs: Int
+        /// Agent iteration index — groups sub-steps into one card.
+        let group: Int
+        /// Full log content (AX tree, raw vision response) for copy/expand.
+        let detail: String
 
         enum Kind { case stt, vision, reasoning, tts, tool }
         enum Status { case pending, running, success, failed }
